@@ -1,0 +1,122 @@
+drop table if exists tableau.mau_dashboard_final; 
+create table tableau.mau_dashboard_final as 
+
+with marketing_data as 
+(
+select 
+    register_source.customer_user_id
+    ,register_source.register_date
+    ,register_source.MARKETING_MEDIA
+    ,register_source.register_partner as partner
+    ,coalesce(lookup.campaign_name,register_source.campaign) as campaign_name
+    ,case when (lookup.marketing_group is null or lookup.marketing_group = '' or lookup.marketing_group = 'Not Tagged') and (register_source.MARKETING_MEDIA like '%int%') 
+        then 'Performance Marketing'
+        else lookup.marketing_group end as marketing_group
+    ,case when (lookup.marketing_subgroup = '' or lookup.marketing_subgroup is null or lookup.marketing_subgroup = 'Not Tagged') and register_source.MARKETING_MEDIA like '%int%' 
+        and register_source.MARKETING_MEDIA not in ('doubleclick_int','dv360_int','rtbhouse_int','personalyrtb_int','mobavenue2_int','vizury_int','inmobi_int','criteonew_int') THEN 'App Install' 
+    WHEN lookup.marketing_subgroup not in ('Conversion-Existing','Activation-Existing') and register_source.MARKETING_MEDIA like '%int%' 
+        and register_source.MARKETING_MEDIA not in ('doubleclick_int','dv360_int','rtbhouse_int','personalyrtb_int','mobavenue2_int','vizury_int','inmobi_int','criteonew_int') THEN 'App Install' 
+    else lookup.marketing_subgroup end as marketing_subgroup
+    ,case when coalesce(marketing_group,'NA') not in ('Brand','GTM') and (register_partner in (select * from appsflyer_android.pm_partner_list group by 1) or 
+            register_source.MARKETING_MEDIA in (select * from appsflyer_android.pm_marketing_media_list a where upper(a.marketing_media) not in ('EMAIL','PUSH','SMS') group by 1)) then 'PM' 
+        when (upper(register_source.MARKETING_MEDIA) like '%EMAIL%' or upper(register_source.MARKETING_MEDIA) like '%SMS%' or upper(register_source.MARKETING_MEDIA) like '%PUSH%'
+        or upper(register_source.MARKETING_MEDIA) like '%BANNER%' or upper(register_source.MARKETING_MEDIA) like '%WHATSAPP%' or upper(register_source.MARKETING_MEDIA) like '%APPPOPUP%'
+        or upper(register_source.MARKETING_MEDIA) in ('EMAIL','PUSH','SMS','EMAIL_MARKETING','SMS_MARKETING','PUSH_MARKETING')) then 'CLM'
+        when register_source.MARKETING_MEDIA in ('Organic','SEO') THEN  'Organic + SEO'
+        when register_source.MARKETING_MEDIA is null then 'Web + Untracked'
+        else 'Non-PM' end as pm_touchpoint
+    ,coalesce(lookup.adset_id,register_source.Register_ADSET_ID) as adset_id
+    ,coalesce(lookup.campaign_id,register_source.register_campaign_id) as campaign_id
+    from
+    (with adset_cte as
+        (SELECT cast(CAMPAIGNID as varchar(1000)) CAMPAIGNID FROM GOOGLE_ADS_MCC.CAMPAIGN_PERFORMANCE_REPORT
+        WHERE ADVERTISINGSUBCHANNEL = 'Universal App Campaign' AND STARTDATE >= '2021-10-01' and campaignid is not null group by 1
+        union all
+        SELECT cast(campaign_id as varchar(1000)) CAMPAIGNID FROM GOOGLE_ADS_MCC_v1.CAMPAIGN_PERFORMANCE_REPORT
+        WHERE customer_descriptive_name = 'Unacademy-TP-Acquisition' AND campaign_start_date >= '2022-04-16' and campaign_id is not null group by 1
+        )
+
+        select
+        base.customer_user_id
+        ,date(install_time) as register_date
+        ,TRIM(marketing_dashboard_campaign(MEDIA_SOURCE,campaign_id,campaign,partner,DVMAPPING.campaign_id_text)) AS register_campaign_id
+        ,TRIM(marketing_dashboard_partner(media_source,partner,adset)) as register_partner
+        ,TRIM(marketing_dashboard_adset(MEDIA_SOURCE,goal_followed,base.campaign_id,ADSET_ID,TRIM(marketing_dashboard_partner(media_source,partner,adset)),adset_cte.CAMPAIGNID)) as Register_ADSET_ID
+        ,marketing_dashboard_media(MEDIA_SOURCE,'APP',TRIM(marketing_dashboard_partner(media_source,partner,adset)),CAMPAIGN) AS MARKETING_MEDIA
+        ,base.campaign
+        
+        from
+        (
+         select base.*,row_number() over(partition by customer_user_id order by install_time) as rnn
+         from
+           appsflyer_android.register_master_table base
+        )base
+
+        left join
+        tableau.signups_category_wise_marketing_cost_calculation lookup
+        on base.customer_user_id=lookup.user_uid
+        and base.rnn=1
+
+        LEFT JOIN
+        (
+            select
+            cast(cast("cm placement id__decimal" as int) as varchar(1000)) AS PLACEMENT_ID,
+            cast(cast("campaign id__decimal" as int) as varchar(1000)) as campaign_id_text
+            FROM analytics.marketing_cost_tracker."yoptima category mapping"
+            GROUP BY 1,2
+        )DVMAPPING
+        ON substring(BASE.campaign_id,1,(len(BASE.campaign_id)-(case when position('.' in BASE.campaign_id) > 0 then 2  end)))=DVMAPPING.PLACEMENT_ID
+        AND BASE.MEDIA_SOURCE='doubleclick_int'
+
+        /*addition to incorporate the adset function cte*/
+        LEFT JOIN
+        adset_cte
+        on base.campaign_id = adset_cte.CAMPAIGNID
+        where is_fake='GENUINE') register_source
+        
+      
+      left join
+      (
+            select base.*,row_number() over(partition by campaign_id,adset_id,marketing_media) as rn
+            from marketing_cost_tracker."marketing campaign lookup" base
+      )lookup
+      on register_source.register_campaign_id=lookup.campaign_id
+      and register_source.Register_ADSET_ID=lookup.adset_id
+      and register_source.marketing_media=lookup.marketing_media
+      and lookup.rn=1 
+)
+
+select  date_trunc('day',activity_timestamp) as activity_date,
+	    topology_id, 
+	    tt.name as topology_name, 
+	    mau.business_category_name, 
+	    bclgm.vertical, 
+	    activity, 
+	    marketing_media, 
+	    partner, 
+	    campaign_id, 
+	    campaign_name, 
+	    marketing_group, 
+	    marketing_subgroup, 
+	    pm_touchpoint,
+	    case when mau.rk=1 then 'New' when mau.rk>1 then 'Repeat' end as f_New, 
+	    count(distinct learner_uid) as learners, 
+	    sum(sql_flag) as sql_conversions,
+	    sum(purchased_flag) as purchases 
+from (select *, rank() over(partition by learner_uid, activity_month order by activity_timestamp) rk 
+from sandbox_analytics.tbl_mau_learner_final 
+where activity_timestamp::date >= '2022-01-01') mau 
+left join topology_topology tt on tt.id = mau.topology_id
+left join sandbox_analytics.business_category_leader_goal_mapping bclgm on bclgm.goal_id = mau.topology_id
+left join marketing_data md on mau.learner_uid = md.customer_user_id 
+where mau.activity_timestamp::date >= '2022-01-01' 
+group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14 
+
+
+
+
+
+	
+	
+
+
